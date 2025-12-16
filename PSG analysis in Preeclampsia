@@ -1,0 +1,170 @@
+###############################################################################
+# PSG expression analysis in Preeclampsia (Control vs PE) from TPM table
+# - Reads Gene TPM.csv + Ensembl ID map
+# - Maps ENSG -> gene symbol (if needed)
+# - Extracts PSG* genes, log2(TPM+1)
+# - Makes one multi-panel PDF + individual PNGs (optional)
+# - Also writes out PSG matrix + simple stats
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(stringr)
+  library(dplyr)
+})
+
+# ------------------------------ 0) I/O paths ---------------------------------
+tpm_file <- "~/Dropbox/Ongoing/papers/psg9/PE_RNAseq_Julia/Gene TPM.csv"
+ens_file <- "~/Dropbox/ACE_Papers/figures and tables/ensembl_human_ID.txt"
+
+# ------------------------------ 1) Read data ---------------------------------
+# Your history had se="," (typo) and stringsAsFactor (typo). Use read.csv safely.
+tpm <- read.csv(tpm_file, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+
+# ensembl_human_ID.txt: assume tab-delimited with at least 2 cols:
+# col1 = ENSEMBL_ID, col2 = SYMBOL (adjust below if your file differs)
+ens <- read.delim(ens_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+
+stopifnot(nrow(tpm) > 0, nrow(ens) > 0)
+
+# ------------------------------ 2) Normalize IDs ------------------------------
+# Heuristics: detect ID and symbol columns
+pick_col <- function(df, patterns) {
+  idx <- which(sapply(df, function(x) any(grepl(patterns, colnames(df), ignore.case = TRUE))))
+  idx[1]
+}
+
+# TPM: first column often gene id
+gene_id_col <- 1
+
+# Ensembl map: try common names
+ens_id_col <- which(grepl("ensembl|gene.?id|ensg", colnames(ens), ignore.case = TRUE))[1]
+sym_col    <- which(grepl("symbol|gene.?name|hgnc", colnames(ens), ignore.case = TRUE))[1]
+
+if (is.na(ens_id_col) || is.na(sym_col)) {
+  # fallback: assume first col = ensembl id, second col = symbol
+  ens_id_col <- 1
+  sym_col <- 2
+}
+
+ens <- ens[, c(ens_id_col, sym_col)]
+colnames(ens) <- c("gene_id", "symbol")
+ens <- ens[!duplicated(ens$gene_id), ]
+
+# TPM: standardize gene_id column name
+colnames(tpm)[gene_id_col] <- "gene_id"
+
+# Drop duplicated genes in TPM table
+tpm <- tpm[!duplicated(tpm$gene_id), ]
+
+# ------------------------------ 3) Map to symbols -----------------------------
+# If tpm$gene_id already looks like symbols (e.g., "PSG9"), mapping will mostly be NA;
+# we keep original.
+mapped <- merge(ens, tpm, by = "gene_id", all = FALSE)
+
+# Decide whether to use symbol or gene_id as rownames:
+# - if a lot of symbols are non-empty, use symbols; else use gene_id
+use_symbol <- mean(!is.na(mapped$symbol) & mapped$symbol != "") > 0.5
+
+expr <- mapped
+rownames(expr) <- if (use_symbol) expr$symbol else expr$gene_id
+
+# Keep only numeric expression columns (everything except gene_id/symbol)
+drop_cols <- intersect(c("gene_id", "symbol"), colnames(expr))
+expr <- expr[, setdiff(colnames(expr), drop_cols), drop = FALSE]
+
+# Ensure numeric matrix
+expr[] <- lapply(expr, function(x) as.numeric(as.character(x)))
+expr[is.na(expr)] <- 0
+
+# ------------------------------ 4) Extract PSGs -------------------------------
+psg <- expr[grep("^PSG", rownames(expr)), , drop = FALSE]
+stopifnot(nrow(psg) > 0)
+
+psg_log2 <- log2(psg + 1)
+
+# ------------------------------ 5) Define groups ------------------------------
+# Your history: Control = first 8, PE = next 10 (8 + 10 = 18)
+# If columns are not in that order, set these explicitly.
+n_ctrl <- 8
+ctrl_cols <- 1:n_ctrl
+pe_cols   <- (n_ctrl + 1):ncol(psg_log2)
+
+stopifnot(length(ctrl_cols) > 0, length(pe_cols) > 0)
+
+# ------------------------------ 6) Plotting ----------------------------------
+# Use base R boxplot + jitter (less brittle than vioplot; no install needed)
+dir.create("PSG_PE_plots", showWarnings = FALSE)
+
+# Multi-panel PDF (all PSGs)
+pdf("PSG_PE_plots/PSG_all_boxplots.pdf", width = 6.5, height = 10)
+par(mfrow = c(ceiling(nrow(psg_log2) / 2), 2), mar = c(5, 4, 3, 1))
+
+for (g in rownames(psg_log2)) {
+  y1 <- as.numeric(psg_log2[g, ctrl_cols])
+  y2 <- as.numeric(psg_log2[g, pe_cols])
+
+  boxplot(list(Control = y1, PE = y2),
+          main = paste0(g, " expression"),
+          ylab = "log2(TPM+1)",
+          outline = FALSE)
+
+  stripchart(list(y1, y2),
+             vertical = TRUE, method = "jitter",
+             add = TRUE, pch = 20, cex = 0.8)
+
+  # quick stats (Wilcoxon; TPM isn't normal)
+  p <- suppressWarnings(wilcox.test(y1, y2)$p.value)
+  mtext(paste0("Wilcoxon p=", signif(p, 3)), side = 3, line = 0.2, cex = 0.8)
+}
+dev.off()
+
+# Individual PNGs (one per PSG)
+for (g in rownames(psg_log2)) {
+  y1 <- as.numeric(psg_log2[g, ctrl_cols])
+  y2 <- as.numeric(psg_log2[g, pe_cols])
+  png(paste0("PSG_PE_plots/", g, "_Expression_Control_PE.png"),
+      width = 10.7, height = 12.8, units = "cm", res = 600, pointsize = 12)
+
+  boxplot(list(Control = y1, PE = y2),
+          main = paste0(g, " expression"),
+          ylab = "log2(TPM+1)",
+          outline = FALSE)
+
+  stripchart(list(y1, y2),
+             vertical = TRUE, method = "jitter",
+             add = TRUE, pch = 20, cex = 0.9)
+
+  p <- suppressWarnings(wilcox.test(y1, y2)$p.value)
+  mtext(paste0("Wilcoxon p=", signif(p, 3)), side = 3, line = 0.2, cex = 0.9)
+  dev.off()
+}
+
+# ------------------------------ 7) Outputs -----------------------------------
+write.table(psg,      "PSG_PE_plots/PSG_TPM_raw.tsv",  sep = "\t", quote = FALSE, col.names = NA)
+write.table(psg_log2, "PSG_PE_plots/PSG_log2TPM1.tsv", sep = "\t", quote = FALSE, col.names = NA)
+
+# "relative to mean" like your history: row-center each PSG across samples
+psg_rel <- sweep(psg_log2, 1, rowMeans(psg_log2), "-")
+write.table(psg_rel, "PSG_PE_plots/PSG_log2TPM1_rowCentered.tsv",
+            sep = "\t", quote = FALSE, col.names = NA)
+
+# simple stats table
+stats <- data.frame(
+  gene = rownames(psg_log2),
+  mean_control = apply(psg_log2[, ctrl_cols, drop = FALSE], 1, mean),
+  mean_PE      = apply(psg_log2[, pe_cols,   drop = FALSE], 1, mean),
+  delta_PE_minus_control = apply(psg_log2[, pe_cols, drop = FALSE], 1, mean) -
+                           apply(psg_log2[, ctrl_cols, drop = FALSE], 1, mean),
+  wilcox_p = apply(psg_log2, 1, function(v) {
+    y1 <- as.numeric(v[ctrl_cols]); y2 <- as.numeric(v[pe_cols])
+    suppressWarnings(wilcox.test(y1, y2)$p.value)
+  })
+)
+stats$wilcox_p_adj <- p.adjust(stats$wilcox_p, method = "BH")
+write.table(stats, "PSG_PE_plots/PSG_stats_Control_vs_PE.tsv",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# If you still want vioplot specifically (optional):
+# install.packages("vioplot"); library(vioplot)
+
+message("Done. Outputs in: PSG_PE_plots/")
