@@ -1,0 +1,107 @@
+bash scripts/01_summarize_chimeric_junctions.sh hiPSC1_Chimeric.out.junction analysis/hiPSC1_Chimeric
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Requires: bedtools, sort-bed (bedops), awk
+# Inputs:
+#   junction_tsv: from step 1 (canonical or noncanonical)
+#   rmsk_bed: RepeatMasker bed (sorted)
+#   genes_bed: gene annotation bed (sorted; gene name in a consistent column)
+# Output:
+#   TSV: junctions annotated with rmsk + genes
+#
+# NOTE: This script keeps both donor and acceptor windows in one line
+# and intersects them sequentially (junction -> rmsk -> genes).
+
+junction_tsv="${1:?Usage: $0 <junctions.tsv> <rmsk.bed> <genes.bed> <out.tsv> [window_bp]}"
+rmsk_bed="${2:?Usage: $0 <junctions.tsv> <rmsk.bed> <genes.bed> <out.tsv> [window_bp]}"
+genes_bed="${3:?Usage: $0 <junctions.tsv> <rmsk.bed> <genes.bed> <out.tsv> [window_bp]}"
+out_tsv="${4:?Usage: $0 <junctions.tsv> <rmsk.bed> <genes.bed> <out.tsv> [window_bp]}"
+window_bp="${5:-100}"
+
+mkdir -p "$(dirname "$out_tsv")"
+
+# junction_tsv format (from step 1):
+# donor_chr donor_pos donor_strand acc_chr acc_pos acc_strand jtype repL repR count
+#
+# We create two BED intervals (donor window and acceptor window) in one record:
+# donor: [donor_pos - window, donor_pos] or [donor_pos, donor_pos+window] depending on strand
+# acceptor similarly
+#
+# We keep original fields so we can trace back.
+
+awk -v W="$window_bp" 'BEGIN{OFS="\t"}
+{
+  donor_chr=$1; donor_pos=$2; donor_str=$3;
+  acc_chr=$4;   acc_pos=$5;   acc_str=$6;
+
+  # donor window
+  if (donor_str=="-") { d_start=donor_pos;     d_end=donor_pos+W; }
+  else                { d_start=donor_pos-W;   d_end=donor_pos;   }
+  if (d_start<0) d_start=0;
+
+  # acceptor window
+  if (acc_str=="-")   { a_start=acc_pos-W;     a_end=acc_pos;     }
+  else                { a_start=acc_pos;       a_end=acc_pos+W;   }
+  if (a_start<0) a_start=0;
+
+  # Output as a single "combined" BED-like line:
+  # (donor bed3) (donor_str) (acc bed3) (acc_str) (then the rest)
+  print donor_chr,d_start,d_end,donor_str,acc_chr,a_start,a_end,acc_str,$7,$8,$9,$10
+}' "$junction_tsv" \
+| sort-bed - \
+| bedtools intersect -a stdin -b "$rmsk_bed" -wa -wb \
+| awk 'BEGIN{OFS="\t"} {print $5,$6,$7,$8, $0}' \
+| sort-bed - \
+| bedtools intersect -a stdin -b "$genes_bed" -wa -wb \
+> "$out_tsv"
+
+echo "Wrote: $out_tsv"
+bash scripts/02_annotate_junctions_rmsk_genes.sh \
+  analysis/hiPSC1_Chimeric_canonical_junctions.tsv \
+  analysis/hg19_rmsk.bed \
+  analysis/hg19_sorted_gene.bed \
+  rmsk_donor_gene_acceptor/hiPSC1_rmsk_donor_genes_acceptor_canonical.tsv \
+  100
+
+#RUN ON ALL SAPLES
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Edit these paths once
+RMSK_BED="/scratch/AG_Izsvak/HiPSC/STAR_OUT/Cross_human/chimeric/analysis/hg19_rmsk.bed"
+GENES_BED="/scratch/AG_Izsvak/HiPSC/STAR_OUT/Cross_human/chimeric/analysis/hg19_sorted_gene.bed"
+
+WINDOW_BP=100
+
+# Samples: name -> Chimeric.out.junction path
+declare -A SAMPLES=(
+  ["chimp_1a_homo"]="chimp_1aChimeric.out.junction"
+  ["chimp_1b_homo"]="chimp_1bChimeric.out.junction"
+  ["bon_1a_homo"]="bon_1aChimeric.out.junction"
+  ["bon_1b_homo"]="bon_1bChimeric.out.junction"
+  ["gor1_homo"]="gor1Chimeric.out.junction"
+  ["gor2_homo"]="gor2Chimeric.out.junction"
+  ["cal_homo"]="calChimeric.out.junction"
+  ["h1esc"]="h1esc_Chimeric.out.junction"
+  ["hiPSC1"]="hiPSC1_Chimeric.out.junction"
+  ["hiPSC2"]="hiPSC2_Chimeric.out.junction"
+  ["H9_R3"]="H9_R3_Chimeric.out.junction"
+)
+
+mkdir -p analysis rmsk_donor_gene_acceptor
+
+for sample in "${!SAMPLES[@]}"; do
+  in="${SAMPLES[$sample]}"
+
+  echo "==> ${sample}"
+  bash scripts/01_summarize_chimeric_junctions.sh "$in" "analysis/${sample}_Chimeric"
+
+  bash scripts/02_annotate_junctions_rmsk_genes.sh \
+    "analysis/${sample}_Chimeric_canonical_junctions.tsv" \
+    "$RMSK_BED" \
+    "$GENES_BED" \
+    "rmsk_donor_gene_acceptor/${sample}_rmsk_donor_genes_acceptor_canonical.tsv" \
+    "$WINDOW_BP"
+done
