@@ -1,0 +1,46 @@
+Make canonical / non-canonical junction count tables
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Requires: awk, sort, uniq
+# Input: STAR Chimeric.out.junction
+# Output: TSV with donor/acceptor + counts
+
+in="${1:?Usage: $0 <Chimeric.out.junction> <out_prefix>}"
+out_prefix="${2:?Usage: $0 <Chimeric.out.junction> <out_prefix>}"
+
+mkdir -p "$(dirname "${out_prefix}")"
+
+# Columns (STAR manual):
+# 1 donor_chr 2 donor_intron_start 3 donor_strand
+# 4 acc_chr   5 acc_intron_start   6 acc_strand
+# 7 junction_type (-1 between mates, 0 non-canonical, 1 GT/AG, 2 CT/AC)
+# 8 repeat_left 9 repeat_right
+# 10 readname (etc...)
+
+summarize() {
+  local mode="$1"  # canonical|noncanonical
+  local out="$2"
+
+  if [[ "$mode" == "canonical" ]]; then
+    # keep canonical splice motifs (1 or 2)
+    awk 'BEGIN{OFS="\t"} $1!="chrM" && $4!="chrM" && $7>0 {print $1,$2,$3,$4,$5,$6,$7,$8,$9}' "$in"
+  else
+    # keep non-canonical (0) and "between mates" (-1)
+    # IMPORTANT: parentheses so chrM filter applies to both cases
+    awk 'BEGIN{OFS="\t"} $1!="chrM" && $4!="chrM" && ($7==0 || $7<0) {print $1,$2,$3,$4,$5,$6,$7,$8,$9}' "$in"
+  fi \
+  | sort \
+  | uniq -c \
+  | sort -k1,1rn \
+  | awk 'BEGIN{OFS="\t"} {print $2,$3,$4,$5,$6,$7,$8,$9,$10,$1}' \
+  > "$out"
+}
+
+summarize canonical    "${out_prefix}_canonical_junctions.tsv"
+summarize noncanonical "${out_prefix}_noncanonical_junctions.tsv"
+
+echo "Wrote:"
+echo "  ${out_prefix}_canonical_junctions.tsv"
+echo "  ${out_prefix}_noncanonical_junctions.tsv"
