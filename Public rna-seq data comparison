@@ -1,0 +1,297 @@
+#!/usr/bin/env Rscript
+
+# ============================================================
+# Public scRNA-seq analysis (Seurat)
+# Example input: GSE89497_Human_Placenta_TMP_V2.txt
+# Produces: QC plots, PCA/UMAP, marker heatmap, marker plots, RDS
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+  library(readr)
+})
+
+set.seed(1)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+ensure_dir <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  invisible(path)
+}
+
+save_plot <- function(p, out_png, width_cm = 18, height_cm = 14, dpi = 600) {
+  ensure_dir(dirname(out_png))
+  ggsave(out_png, plot = p, width = width_cm, height = height_cm, units = "cm", dpi = dpi)
+}
+
+read_expression_matrix <- function(path,
+                                  delim = "\t",
+                                  gene_col = 1,
+                                  make_unique_genes = TRUE) {
+  # Reads a gene x cell table. If the first column contains gene names, set rownames.
+  x <- read.delim(path, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE, sep = delim)
+
+  if (gene_col %||% 0 > 0) {
+    genes <- x[[gene_col]]
+    x[[gene_col]] <- NULL
+    if (make_unique_genes) genes <- make.unique(genes)
+    rownames(x) <- genes
+  }
+
+  mat <- as.matrix(x)
+  storage.mode(mat) <- "numeric"
+  mat
+}
+
+`%||%` <- function(x, y) if (!is.null(x)) x else y
+
+make_seurat_object <- function(mat,
+                               project = "public_scRNA",
+                               min_cells = 3,
+                               min_features = 200,
+                               cell_names_delim = NULL,
+                               cell_names_field = NULL) {
+  if (!is.null(cell_names_delim) && !is.null(cell_names_field)) {
+    obj <- CreateSeuratObject(
+      counts = mat,
+      project = project,
+      min.cells = min_cells,
+      min.features = min_features,
+      names.delim = cell_names_delim,
+      names.field = cell_names_field
+    )
+  } else {
+    obj <- CreateSeuratObject(
+      counts = mat,
+      project = project,
+      min.cells = min_cells,
+      min.features = min_features
+    )
+  }
+
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj
+}
+
+qc_filter <- function(obj,
+                      min_features = 200,
+                      max_features = 2500,
+                      max_percent_mt = 5) {
+  subset(
+    obj,
+    subset = nFeature_RNA > min_features &
+      nFeature_RNA < max_features &
+      percent.mt < max_percent_mt
+  )
+}
+
+run_standard_pipeline <- function(obj,
+                                  regress_percent_mt = TRUE,
+                                  nfeatures = 2000,
+                                  npcs = 30,
+                                  dims_use = 1:10,
+                                  resolution = 0.4) {
+  obj <- NormalizeData(obj, normalization.method = "LogNormalize")
+
+  obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = nfeatures)
+
+  if (regress_percent_mt) {
+    obj <- ScaleData(obj, vars.to.regress = "percent.mt")
+  } else {
+    obj <- ScaleData(obj, features = rownames(obj))
+  }
+
+  obj <- RunPCA(obj, features = VariableFeatures(obj))
+
+  obj <- FindNeighbors(obj, dims = dims_use)
+  obj <- FindClusters(obj, resolution = resolution)
+
+  obj <- RunUMAP(obj, dims = dims_use)
+
+  obj
+}
+
+top_markers_per_cluster <- function(obj,
+                                   only_pos = TRUE,
+                                   min_pct = 0.25,
+                                   logfc_threshold = 0.25,
+                                   top_n = 10) {
+  markers <- FindAllMarkers(
+    obj,
+    only.pos = only_pos,
+    min.pct = min_pct,
+    logfc.threshold = logfc_threshold
+  )
+
+  # Seurat returns a column "gene" (not rownames) in newer versions
+  markers %>%
+    group_by(cluster) %>%
+    slice_max(order_by = avg_log2FC %||% avg_logFC, n = top_n, with_ties = FALSE) %>%
+    ungroup()
+}
+
+rename_clusters_safe <- function(obj, cluster_map_named) {
+  # cluster_map_named: named character vector, e.g. c("0"="Cyto_TB","1"="Syn_TB",...)
+  stopifnot(is.character(cluster_map_named), !is.null(names(cluster_map_named)))
+  missing <- setdiff(levels(obj), names(cluster_map_named))
+  if (length(missing) > 0) {
+    stop("Cluster map missing these cluster IDs: ", paste(missing, collapse = ", "))
+  }
+  RenameIdents(obj, cluster_map_named)
+}
+
+set_ident_order <- function(obj, levels_order) {
+  Idents(obj) <- factor(Idents(obj), levels = levels_order)
+  obj
+}
+
+# ----------------------------
+# Plot wrappers
+# ----------------------------
+
+plot_qc <- function(obj) {
+  VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+}
+
+plot_variable_features <- function(obj, top_n = 10) {
+  top <- head(VariableFeatures(obj), top_n)
+  p1 <- VariableFeaturePlot(obj)
+  p2 <- LabelPoints(plot = p1, points = top, repel = TRUE)
+  p1 + p2
+}
+
+plot_umap <- function(obj, label = TRUE, pt_size = 0.5) {
+  DimPlot(obj, reduction = "umap", label = label, pt.size = pt_size) + NoLegend()
+}
+
+plot_marker_heatmap <- function(obj, features) {
+  DoHeatmap(obj, features = features) + NoLegend()
+}
+
+plot_markers_violin <- function(obj, features, pt_size = 0, slot = "counts", log = TRUE, same_y = TRUE, ncol = 3) {
+  VlnPlot(obj, features = features, slot = slot, log = log, same.y.lims = same_y, pt.size = pt_size, ncol = ncol)
+}
+
+plot_markers_feature <- function(obj, features, slot = "counts", min_cutoff = "q10", max_cutoff = "q90") {
+  FeaturePlot(obj, features = features, slot = slot, min.cutoff = min_cutoff, max.cutoff = max_cutoff)
+}
+
+# ============================================================
+# MAIN (edit paths + parameters here)
+# ============================================================
+
+main <- function() {
+  input_path <- "GSE89497_Human_Placenta_TMP_V2.txt"
+  out_dir <- "results/GSE89497_placenta_seurat"
+  ensure_dir(out_dir)
+
+  # If your file has genes in column 1 and cells in remaining columns, keep gene_col=1.
+  mat <- read_expression_matrix(input_path, delim = "\t", gene_col = 1)
+
+  # If cell names contain metadata like "xxx_yyy" and you want Seurat to parse, set these:
+  # cell_names_delim <- "_"
+  # cell_names_field <- 2
+  cell_names_delim <- NULL
+  cell_names_field <- NULL
+
+  obj <- make_seurat_object(
+    mat,
+    project = "GSE89497_Placenta",
+    min_cells = 3,
+    min_features = 200,
+    cell_names_delim = cell_names_delim,
+    cell_names_field = cell_names_field
+  )
+
+  # QC plot (before filtering)
+  save_plot(plot_qc(obj), file.path(out_dir, "QC_violin_prefilter.png"), width_cm = 22, height_cm = 10)
+
+  # Filter
+  obj <- qc_filter(obj, min_features = 200, max_features = 2500, max_percent_mt = 5)
+
+  # Variable features plot
+  obj <- NormalizeData(obj)
+  obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000)
+  save_plot(plot_variable_features(obj, top_n = 10), file.path(out_dir, "VariableFeatures.png"), width_cm = 22, height_cm = 10)
+
+  # Full pipeline (re-normalize is fine; keeps code simple/reproducible)
+  obj <- make_seurat_object(
+    GetAssayData(obj, layer = "counts") %||% GetAssayData(obj, slot = "counts"),
+    project = "GSE89497_Placenta",
+    min_cells = 3,
+    min_features = 200,
+    cell_names_delim = cell_names_delim,
+    cell_names_field = cell_names_field
+  )
+  obj <- qc_filter(obj, min_features = 200, max_features = 2500, max_percent_mt = 5)
+  obj <- run_standard_pipeline(obj, regress_percent_mt = TRUE, dims_use = 1:10, resolution = 0.4)
+
+  # PCA + UMAP plots
+  save_plot(ElbowPlot(obj), file.path(out_dir, "PCA_elbow.png"), width_cm = 14, height_cm = 12)
+  save_plot(plot_umap(obj, label = TRUE, pt_size = 0.5), file.path(out_dir, "UMAP_clusters.png"), width_cm = 16, height_cm = 14)
+
+  # Marker discovery + heatmap
+  markers_top10 <- top_markers_per_cluster(obj, top_n = 10)
+  write_tsv(markers_top10, file.path(out_dir, "Top10_markers_per_cluster.tsv"))
+
+  save_plot(
+    plot_marker_heatmap(obj, features = unique(markers_top10$gene)),
+    file.path(out_dir, "Heatmap_top10_markers.png"),
+    width_cm = 22,
+    height_cm = 28
+  )
+
+  # Example trophoblast marker violin plot (edit freely)
+  tropho_markers <- c("CYP11A1", "ALDH3B2", "DACT2", "EPS8L1", "SPINT1", "CSF2RB")
+  save_plot(
+    plot_markers_violin(obj, features = tropho_markers, pt_size = 0, same_y = TRUE, ncol = 3),
+    file.path(out_dir, "VlnPlot_tropho_markers.png"),
+    width_cm = 22,
+    height_cm = 16
+  )
+
+  # Save object
+  saveRDS(obj, file = file.path(out_dir, "seurat_object_preannotated.rds"))
+
+  # ----------------------------
+  # OPTIONAL: re-annotation
+  # Provide a named mapping from cluster IDs (levels(obj)) to cell types.
+  # Example for 10 clusters (0-9): EDIT to match your clustering results.
+  # ----------------------------
+  # cluster_map <- c(
+  #   "0" = "Cyto_TB",
+  #   "1" = "Syn_TB",
+  #   "2" = "EV_TB_pre",
+  #   "3" = "EV_TB_mat",
+  #   "4" = "EV_TB_stab",
+  #   "5" = "EV_TB_24W",
+  #   "6" = "Macrophage_1",
+  #   "7" = "Macrophage_2",
+  #   "8" = "Mesenchyme",
+  #   "9" = "Blood"
+  # )
+  #
+  # obj2 <- rename_clusters_safe(obj, cluster_map)
+  # desired_order <- c("Cyto_TB","Syn_TB","EV_TB_pre","EV_TB_mat","EV_TB_stab","EV_TB_24W",
+  #                    "Macrophage_1","Macrophage_2","Mesenchyme","Blood")
+  # obj2 <- set_ident_order(obj2, desired_order)
+  #
+  # save_plot(plot_umap(obj2, label = TRUE, pt_size = 0.5),
+  #           file.path(out_dir, "UMAP_celltypes.png"),
+  #           width_cm = 16, height_cm = 14)
+  #
+  # saveRDS(obj2, file = file.path(out_dir, "seurat_object_annotated.rds"))
+
+  message("Done. Outputs in: ", out_dir)
+}
+
+# Run if executed as script
+if (sys.nframe() == 0) {
+  main()
+}
