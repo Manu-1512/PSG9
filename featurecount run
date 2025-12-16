@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FEATURECOUNTS_BIN="featureCounts"
+THREADS=2
+
+GTF_GENES="/workdir/Manu/Homo_Genome/gtf_files/genes.gtf"
+GTF_TE="/workdir/Manu/Homo_Genome/gtf_files/Human_class2_TE.gtf"
+
+# Mode:
+# - standard counting: no -f
+# - locus-level counting (feature-level): use -f (and typically -O/-M if you want overlaps/multimappers)
+COUNT_TE_LOCI=false
+
+for bam in ./*_Aligned.sortedByCoord.out.bam; do
+  [[ -e "$bam" ]] || { echo "No *_Aligned.sortedByCoord.out.bam found."; exit 1; }
+
+  sample="${bam%_Aligned.sortedByCoord.out.bam}"
+  echo "==> featureCounts: $sample"
+
+  # Gene counts
+  "$FEATURECOUNTS_BIN" \
+    -T "$THREADS" \
+    -t exon \
+    -g gene_id \
+    -a "$GTF_GENES" \
+    -o "${sample}_genes.tsv" \
+    "$bam"
+
+  # TE counts (family/element depending on how Human_class2_TE.gtf is defined)
+  if [[ "$COUNT_TE_LOCI" == "true" ]]; then
+    "$FEATURECOUNTS_BIN" \
+      -T "$THREADS" \
+      -t exon \
+      -g gene_id \
+      -f \
+      -a "$GTF_TE" \
+      -o "${sample}_rmsk_loci.tsv" \
+      "$bam"
+  else
+    "$FEATURECOUNTS_BIN" \
+      -T "$THREADS" \
+      -t exon \
+      -g gene_id \
+      -a "$GTF_TE" \
+      -o "${sample}_rmsk.tsv" \
+      "$bam"
+  fi
+done
