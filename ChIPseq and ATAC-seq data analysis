@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+################################################################################
+# Small RNA alignment + downstream counting/peaks + quick R plotting helper
+# Useful protocol reference (do not hard-code links into scripts in production):
+# https://github.com/TabakoffLab/General/wiki/Small-RNA-Alignment,-Filtering,-and-Annotation
+################################################################################
+
+# ---------------------------- user-config ------------------------------------
+THREADS="${THREADS:-4}"
+
+# bowtie2
+BOWTIE2_BIN="${BOWTIE2_BIN:-/home/msingh/.guix-profile/bin/bowtie2}"
+HG19_BT2_INDEX="${HG19_BT2_INDEX:-/home/msingh/RNAseq/Homo/Genome/bowtie2_index/hg19}"
+
+# STAR
+STAR_BIN="${STAR_BIN:-/programs/STAR/STAR}"
+STAR_GENOME_DIR="${STAR_GENOME_DIR:-/workdir/Manu/Homo_Genome/STAR_Genome_dir}"
+
+# featureCounts
+FEATURECOUNTS_BIN="${FEATURECOUNTS_BIN:-/home/msingh/.guix-profile/bin/featureCounts}"
+GTF_GENES="${GTF_GENES:-/home/msingh/RNAseq/Homo/gtf_files/genes.gtf}"
+GTF_TE="${GTF_TE:-/home/msingh/RNAseq/Homo/gtf_files/Human_class2_TE.gtf}"
+
+# macs2
+MACS2_BIN="${MACS2_BIN:-/home/msingh/.guix-profile/bin/macs2}"
+
+# Where your data lives (edit as needed)
+HAMBURG_DIR="${HAMBURG_DIR:-/scratch/AG_Izsvak/alzheimer/public_bam/hamburg}"
+ATAC_FASTQ_DIR="${ATAC_FASTQ_DIR:-/scratch/AG_Izsvak/DNAse_seq/ATAC_raw/raw/sra_files/fastq_files}"
+ATAC_SRA_DIR="${ATAC_SRA_DIR:-/scratch/AG_Izsvak/DNAse_seq/ATAC_raw/RNAseq}"
+ATAC_BAM_DIR="${ATAC_BAM_DIR:-/scratch/AG_Izsvak/DNAse_seq/ATAC_raw/RNAseq/bam_files}"
+
+COUNTS_OUT="${COUNTS_OUT:-/scratch/AG_Izsvak/DNAse_seq/ATAC_raw/RNAseq/counts}"
+MACS2_OUT="${MACS2_OUT:-/scratch/AG_Izsvak/DNAse_seq/ATAC_raw/raw/macs2_out}"
+
+# qsub resources (SGE)
+QSUB_MEM="${QSUB_MEM:-20G}"
+QSUB_PE="${QSUB_PE:-smp}"
+# -----------------------------------------------------------------------------
+
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./pipeline.sh <command>
+
+Commands:
+  make_bowtie2_qsub_scripts_hamburg   Generate per-sample SGE scripts for paired-end bowtie2 (Hamburg fastq)
+  submit_qsubs <pattern>             qsub all scripts matching pattern (e.g. "*_script")
+  bowtie2_pe_align_dir <dir>         Run bowtie2 locally on all *_R1_001.fastq/*_R2_001.fastq pairs in <dir>
+  sra_to_fastq <dir>                 Generate fastq-dump scripts for *.sra in <dir> (no submission)
+  star_pe_align_dir <dir>            Run STAR locally on all *_1.fastq.gz/*_2.fastq.gz pairs in <dir>
+  featurecounts_dir                  Run featureCounts on all *_Aligned.sortedByCoord.out.bam in ATAC_BAM_DIR
+  macs2_callpeak <bam> <name>        Run macs2 callpeak for one BAM
+  write_r_helpers                    Write an R script with volcano + TE matrix normalization example
+EOF
+}
+
+log() { echo "[$(date '+%F %T')] $*"; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing executable: $1"; exit 1; }
+}
+
+# -----------------------------------------------------------------------------
+# 1) Hamburg bowtie2: generate SGE scripts (paired-end)
+# -----------------------------------------------------------------------------
+make_bowtie2_qsub_scripts_hamburg() {
+  log "Scanning: $HAMBURG_DIR"
+  cd "$HAMBURG_DIR"
+
+  # Find unique sample prefixes from *_R1_001.fastq and *_R2_001.fastq
+  mapfile -t samples < <(ls *_R1_001.fastq 2>/dev/null | sed 's/_R1_001.fastq$//' | sort -u)
+
+  [[ ${#samples[@]} -gt 0 ]] || { echo "No *_R1_001.fastq found in $HAMBURG_DIR"; exit 1; }
+
+  for s in "${samples[@]}"; do
+    script="${s}_script.sh"
+    sam_out="${HAMBURG_DIR}/${s}.sam"
+
+    cat > "$script" <<EOF
+#!/usr/bin/env bash
+#$ -pe $QSUB_PE $THREADS
+#$ -l h_vmem=$QSUB_MEM
+#$ -cwd
+set -euo pipefail
+
+"$BOWTIE2_BIN" \
+  --phred33 -p $THREADS \
+  --very-sensitive-local \
+  -x "$HG19_BT2_INDEX" \
+  -1 "$HAMBURG_DIR/${s}_R1_001.fastq" \
+  -2 "$HAMBURG_DIR/${s}_R2_001.fastq" \
+  -S "$sam_out"
+EOF
+    chmod +x "$script"
+    log "Wrote: $script"
+  done
+
+  log "Done. Submit with: ./pipeline.sh submit_qsubs '*_script.sh'"
+}
+
+submit_qsubs() {
+  local pattern="${1:-*_script.sh}"
+  shopt -s nullglob
+  local scripts=( $pattern )
+  [[ ${#scripts[@]} -gt 0 ]] || { echo "No scripts matching: $pattern"; exit 1; }
+
+  for s in "${scripts[@]}"; do
+    log "qsub $s"
+    qsub "$s"
+  done
+}
+
+# -----------------------------------------------------------------------------
+# 2) Run bowtie2 locally on a directory of paired fastq files
+# -----------------------------------------------------------------------------
+bowtie2_pe_align_dir() {
+  local dir="${1:?Provide directory}"
+  cd "$dir"
+
+  mapfile -t samples < <(ls *_R1_001.fastq 2>/dev/null | sed 's/_R1_001.fastq$//' | sort -u)
+  [[ ${#samples[@]} -gt 0 ]] || { echo "No *_R1_001.fastq found in $dir"; exit 1; }
+
+  for s in "${samples[@]}"; do
+    log "bowtie2: $s"
+    "$BOWTIE2_BIN" \
+      --phred33 -p "$THREADS" \
+      --very-sensitive-local \
+      -x "$HG19_BT2_INDEX" \
+      -1 "${s}_R1_001.fastq" \
+      -2 "${s}_R2_001.fastq" \
+      -S "${s}.sam"
+  done
+}
+
+# -----------------------------------------------------------------------------
+# 3) Generate fastq-dump scripts for SRA files
+# -----------------------------------------------------------------------------
+sra_to_fastq() {
+  local dir="${1:?Provide directory with *.sra}"
+  local FASTQDUMP_BIN="${FASTQDUMP_BIN:-/home/msingh/tools/sratoolkit.2.5.4-1-ubuntu64/bin/fastq-dump}"
+
+  cd "$dir"
+  shopt -s nullglob
+  local sras=( *.sra )
+  [[ ${#sras[@]} -gt 0 ]] || { echo "No *.sra in $dir"; exit 1; }
+
+  for f in "${sras[@]}"; do
+    base="$(basename "$f" .sra)"
+    script="${base}_dump_script.sh"
+    cat > "$script" <<EOF
+#!/usr/bin/env bash
+#$ -pe $QSUB_PE 1
+#$ -l h_vmem=8G
+#$ -cwd
+set -euo pipefail
+"$FASTQDUMP_BIN" --split-3 "$dir/$f" -O "$dir"
+EOF
+    chmod +x "$script"
+    log "Wrote: $script"
+  done
+}
+
+# -----------------------------------------------------------------------------
+# 4) STAR paired-end align in a directory containing *_1.fastq.gz *_2.fastq.gz
+# -----------------------------------------------------------------------------
+star_pe_align_dir() {
+  local dir="${1:?Provide directory}"
+  cd "$dir"
+
+  mapfile -t samples < <(ls *_1.fastq.gz 2>/dev/null | sed 's/_1.fastq.gz$//' | sort -u)
+  [[ ${#samples[@]} -gt 0 ]] || { echo "No *_1.fastq.gz found in $dir"; exit 1; }
+
+  for s in "${samples[@]}"; do
+    log "STAR: $s"
+    "$STAR_BIN" \
+      --genomeDir "$STAR_GENOME_DIR" \
+      --readFilesCommand zcat \
+      --readFilesIn "${s}_1.fastq.gz" "${s}_2.fastq.gz" \
+      --runThreadN "$THREADS" \
+      --alignIntronMin 20 \
+      --alignIntronMax 1000000 \
+      --chimSegmentMin 15 \
+      --chimJunctionOverhangMin 15 \
+      --outFilterMultimapNmax 20 \
+      --outFileNamePrefix "${s}_" \
+      --outSAMtype BAM SortedByCoordinate \
+      --outReadsUnmapped Fastx
+  done
+}
+
+# -----------------------------------------------------------------------------
+# 5) featureCounts on STAR BAMs (genes + TE; includes your TE overlap settings)
+# -----------------------------------------------------------------------------
+featurecounts_dir() {
+  mkdir -p "$COUNTS_OUT/rmsk" "$COUNTS_OUT/rmsk_loci" "$COUNTS_OUT/genes"
+
+  shopt -s nullglob
+  local bams=( "$ATAC_BAM_DIR"/*_Aligned.sortedByCoord.out.bam )
+  [[ ${#bams[@]} -gt 0 ]] || { echo "No STAR BAMs in: $ATAC_BAM_DIR"; exit 1; }
+
+  for bam in "${bams[@]}"; do
+    sample="$(basename "$bam" _Aligned.sortedByCoord.out.bam)"
+    log "featureCounts: $sample"
+
+    # TE (family/element counts; no -f)
+    "$FEATURECOUNTS_BIN" \
+      -T 2 -t exon -g gene_id \
+      -a "$GTF_TE" \
+      -o "$COUNTS_OUT/rmsk/${sample}_re_rmsk.tsv" \
+      "$bam"
+
+    # TE loci (-f) + overlap behavior (your original flags)
+    "$FEATURECOUNTS_BIN" \
+      -C -p --primary -O --largestOverlap \
+      -T 2 -t exon -g gene_id -f \
+      -a "$GTF_TE" \
+      -o "$COUNTS_OUT/rmsk_loci/${sample}_rmsk_loci.tsv" \
+      "$bam"
+
+    # genes
+    "$FEATURECOUNTS_BIN" \
+      -T 2 -t exon -g gene_id \
+      -a "$GTF_GENES" \
+      -o "$COUNTS_OUT/genes/${sample}_genes.tsv" \
+      "$bam"
+  done
+}
+
+# -----------------------------------------------------------------------------
+# 6) macs2 callpeak
+# -----------------------------------------------------------------------------
+macs2_callpeak() {
+  local bam="${1:?Provide BAM}"
+  local name="${2:?Provide output name}"
+  mkdir -p "$MACS2_OUT"
+
+  log "macs2 callpeak: $name"
+  "$MACS2_BIN" callpeak \
+    --nomodel \
+    -t "$bam" \
+    -f BAM \
+    -g hs \
+    -n "$MACS2_OUT/${name}" \
+    -q 0.01 \
+    -B
+}
+
+# -----------------------------------------------------------------------------
+# 7) Write R helpers (volcano + TE normalization from your last snippet)
+# -----------------------------------------------------------------------------
+write_r_helpers() {
+  cat > "helpers.R" <<'RSCRIPT'
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+# ---------------- Volcano plot (DESeq2-style columns) ----------------
+l1.deg <- fread("volcano_plot_valuesCSCJ.csv")  # expects log2FoldChange, padj
+stopifnot(all(c("log2FoldChange", "padj") %in% names(l1.deg)))
+
+png("DEGs_upon_L1_transposition.png", width=10.8, height=12.8, units="cm", res=600, pointsize=12)
+plot(l1.deg$log2FoldChange, -log10(l1.deg$padj), pch=20, xlab="log2FC", ylab="-log10(padj)", main="")
+abline(h=50, lty=2, lwd=2)
+abline(v=c(-1,1), lty=2, lwd=2)
+
+# background
+idx_bg <- which(-log10(l1.deg$padj) < 50)
+points(l1.deg$log2FoldChange[idx_bg], -log10(l1.deg$padj[idx_bg]), pch=20, col="grey")
+
+# sig down / up
+idx_dn <- which(l1.deg$log2FoldChange < -1 & -log10(l1.deg$padj) > 50)
+idx_up <- which(l1.deg$log2FoldChange >  1 & -log10(l1.deg$padj) > 50)
+points(l1.deg$log2FoldChange[idx_dn], -log10(l1.deg$padj[idx_dn]), pch=20, col="royalblue4")
+points(l1.deg$log2FoldChange[idx_up], -log10(l1.deg$padj[idx_up]), pch=20, col="hotpink4")
+dev.off()
+
+# ---------------- TE matrix: merge + CPM + log2(x+1) ----------------
+# featureCounts outputs have comment lines beginning with '#'
+e1 <- fread("Eight_cell_rep1_re_rmsk.tsv", data.table=FALSE)
+e2 <- fread("Eight_cell_rep2_re_rmsk.tsv", data.table=FALSE)
+i1 <- fread("ICM_rep1_re_rmsk.tsv", data.table=FALSE)
+i2 <- fread("ICM_rep2_re_rmsk.tsv", data.table=FALSE)
+
+# Expect first column to be Geneid and a count column (commonly last)
+# Here we assume count column is the 3rd column like in your snippet.
+dat <- cbind(e1[,c(1,2,3)], e2[,3], i1[,3], i2[,3])
+colnames(dat) <- c("TE","Length","Eight_rep1","Eight_rep2","ICM_rep1","ICM_rep2")
+
+# drop Length for downstream analysis (keep if you need it)
+dat <- dat[, c("TE","Eight_rep1","Eight_rep2","ICM_rep1","ICM_rep2")]
+
+# library sizes (replace with your actual mapped read counts)
+lib_sizes <- c(
+  Eight_rep1 = 13498539,
+  Eight_rep2 = 21018594,
+  ICM_rep1   = 51576159,
+  ICM_rep2   = 46466038
+)
+
+# CPM
+dat$Eight_rep1 <- (dat$Eight_rep1 / lib_sizes["Eight_rep1"]) * 1e6
+dat$Eight_rep2 <- (dat$Eight_rep2 / lib_sizes["Eight_rep2"]) * 1e6
+dat$ICM_rep1   <- (dat$ICM_rep1   / lib_sizes["ICM_rep1"])   * 1e6
+dat$ICM_rep2   <- (dat$ICM_rep2   / lib_sizes["ICM_rep2"])   * 1e6
+
+# log2(CPM+1)
+dat[,2:5] <- log2(dat[,2:5] + 1)
+
+write.table(dat, "Eight_cell_ICM_re_df.tsv", row.names=FALSE, col.names=TRUE,
+            sep="\t", quote=FALSE)
+RSCRIPT
+  log "Wrote: helpers.R"
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  make_bowtie2_qsub_scripts_hamburg) make_bowtie2_qsub_scripts_hamburg ;;
+  submit_qsubs) submit_qsubs "${1:-*_script.sh}" ;;
+  bowtie2_pe_align_dir) bowtie2_pe_align_dir "${1:?dir}" ;;
+  sra_to_fastq) sra_to_fastq "${1:?dir}" ;;
+  star_pe_align_dir) star_pe_align_dir "${1:?dir}" ;;
+  featurecounts_dir) featurecounts_dir ;;
+  macs2_callpeak) macs2_callpeak "${1:?bam}" "${2:?name}" ;;
+  write_r_helpers) write_r_helpers ;;
+  ""|-h|--help) usage ;;
+  *) echo "Unknown command: $cmd"; usage; exit 1 ;;
+esac
