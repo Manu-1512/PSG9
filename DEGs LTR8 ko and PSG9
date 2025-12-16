@@ -1,0 +1,156 @@
+###############################################################################
+# PSG9 DEG analysis (LTR8A KO vs Control) + (PSG9 KD vs Scramble) + comparison
+# - Reads multiple featureCounts TSVs from current directory
+# - Builds a clean count matrix
+# - Runs DESeq2 for two contrasts
+# - Writes DEG tables + normalized counts
+# - Correlates log2FC between KO and KD; exports overlap table
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(stringr)
+})
+
+# --------------------------- 0) Read & build matrix ---------------------------
+file_names <- dir(pattern = "\\.tsv$|\\.txt$", full.names = FALSE)
+stopifnot(length(file_names) > 0)
+
+# featureCounts TSV: first column "Geneid" and last column count
+read_fc <- function(f) {
+  x <- read.delim(f, header = TRUE, comment.char = "#", stringsAsFactors = FALSE, check.names = FALSE)
+  # defend against unexpected formats
+  stopifnot(ncol(x) >= 2)
+  gene_col <- which(tolower(colnames(x)) %in% c("geneid", "gene", "id"))[1]
+  if (is.na(gene_col)) gene_col <- 1
+  # count column is usually last; also can be column matching bam filename
+  cnt_col <- ncol(x)
+  out <- x[, c(gene_col, cnt_col)]
+  colnames(out) <- c("gene", basename(f))
+  out
+}
+
+lst <- lapply(file_names, read_fc)
+
+# merge by gene
+df <- Reduce(function(a, b) merge(a, b, by = "gene", all = TRUE), lst)
+rownames(df) <- df$gene
+df$gene <- NULL
+df[is.na(df)] <- 0
+
+# strip common featureCounts suffixes if present
+colnames(df) <- colnames(df) |>
+  sub("_Aligned\\.sortedByCoord\\.out\\.bam.*$", "", x = _) |>
+  sub("\\.bam.*$", "", x = _) |>
+  sub("\\.tsv$", "", x = _) |>
+  sub("\\.txt$", "", x = _)
+
+# --------------------------- 1) Rename columns (edit once) ---------------------
+# IMPORTANT: set this to match YOUR actual files after stripping.
+# If names already correct, you can skip/modify this block.
+target_names <- c(
+  "Control_R1", "PSG9KD_R1", "Scramble_R3", "PSG9KD_R3",
+  "Scramble_R4", "PSG9KD_R4", "LTR8AKO_R1", "Control_R3",
+  "LTR8AKO_R3", "Control_R4", "LTR8AKO_R4", "Scramble_R1"
+)
+
+if (ncol(df) == length(target_names)) {
+  colnames(df) <- target_names
+} else {
+  message("Column count (", ncol(df), ") != length(target_names) (", length(target_names), ").",
+          "\nLeaving column names as-is. Fix target_names if needed.")
+}
+
+# reorder to your preferred layout
+# KO block first (Control vs LTR8AKO) then KD block (Scramble vs PSG9KD)
+# you originally used: dat <- data_frame[,c(1,8,10,7,9,11,3,5,12,2,4,6)]
+# Here we do equivalent with names (safer):
+ko_cols <- c("Control_R1", "Control_R3", "Control_R4", "LTR8AKO_R1", "LTR8AKO_R3", "LTR8AKO_R4")
+kd_cols <- c("Scramble_R1", "Scramble_R3", "Scramble_R4", "PSG9KD_R1", "PSG9KD_R3", "PSG9KD_R4")
+
+stopifnot(all(ko_cols %in% colnames(df)))
+stopifnot(all(kd_cols %in% colnames(df)))
+
+ko <- df[, ko_cols, drop = FALSE]
+kd <- df[, kd_cols, drop = FALSE]
+
+# --------------------------- 2) DESeq2 helper --------------------------------
+run_deseq <- function(count_mat, condition, level_ref = "control", out_prefix = "DEG") {
+  stopifnot(ncol(count_mat) == length(condition))
+  meta <- data.frame(
+    id  = colnames(count_mat),
+    dex = factor(condition, levels = c(level_ref, setdiff(unique(condition), level_ref))),
+    batch = "batch1",
+    celltype = "A375",
+    row.names = colnames(count_mat),
+    stringsAsFactors = FALSE
+  )
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(as.matrix(count_mat)),
+    colData   = meta,
+    design    = ~ dex
+  )
+  dds <- DESeq(dds)
+
+  # contrast: ref vs other (your original had control vs KD; but DESeq2 contrast is c(var, numerator, denominator))
+  # Here we return (other vs ref) as the default DESeq2 direction: dex_other / dex_ref
+  other <- setdiff(levels(meta$dex), level_ref)[1]
+  res <- results(dds, contrast = c("dex", other, level_ref))
+  res <- res[order(res$pvalue), ]
+
+  norm <- counts(dds, normalized = TRUE)
+
+  write.table(as.data.frame(res),
+              paste0(out_prefix, "_DESeq2_results.tsv"),
+              sep = "\t", quote = FALSE, col.names = NA)
+  write.table(as.data.frame(norm),
+              paste0(out_prefix, "_normalized_counts.tsv"),
+              sep = "\t", quote = FALSE, col.names = NA)
+
+  list(dds = dds, res = res, norm = norm, meta = meta)
+}
+
+# --------------------------- 3) Run KO and KD --------------------------------
+# KO: LTR8AKO vs Control
+ko_condition <- c(rep("control", 3), rep("KO", 3))
+ko_fit <- run_deseq(ko, ko_condition, level_ref = "control", out_prefix = "LTR8A_KO")
+
+# KD: PSG9KD vs Scramble
+kd_condition <- c(rep("control", 3), rep("KD", 3))  # treat Scramble as control
+kd_fit <- run_deseq(kd, kd_condition, level_ref = "control", out_prefix = "PSG9_KD")
+
+# quick checks for PSG9 / trophoblast regulators
+ko_fit$res[grep("^PSG9$|^DLX5$|^GATA3$|^TFAP2C$|^MMP2$", rownames(ko_fit$res)), ]
+kd_fit$res[grep("^PSG9$|^DLX5$|^GATA3$|^TFAP2C$|^MMP2$", rownames(kd_fit$res)), ]
+
+# --------------------------- 4) Compare KO vs KD log2FC -----------------------
+ko_df <- as.data.frame(ko_fit$res); ko_df$gene <- rownames(ko_df)
+kd_df <- as.data.frame(kd_fit$res); kd_df$gene <- rownames(kd_df)
+
+cmp <- merge(
+  ko_df[, c("gene", "log2FoldChange", "pvalue", "padj", "baseMean")],
+  kd_df[, c("gene", "log2FoldChange", "pvalue", "padj", "baseMean")],
+  by = "gene",
+  suffixes = c("_LTR8A_KO", "_PSG9_KD")
+)
+
+# correlations (use complete pairs)
+pear <- with(cmp, cor(log2FoldChange_LTR8A_KO, log2FoldChange_PSG9_KD, use = "complete.obs"))
+spear <- with(cmp, cor(log2FoldChange_LTR8A_KO, log2FoldChange_PSG9_KD, method = "spearman", use = "complete.obs"))
+message("Correlation log2FC KO vs KD: Pearson=", signif(pear, 3), " Spearman=", signif(spear, 3))
+
+# quadrant counts (direction agreement)
+q_pp <- nrow(subset(cmp, log2FoldChange_LTR8A_KO > 0 & log2FoldChange_PSG9_KD > 0))
+q_nn <- nrow(subset(cmp, log2FoldChange_LTR8A_KO < 0 & log2FoldChange_PSG9_KD < 0))
+q_pn <- nrow(subset(cmp, log2FoldChange_LTR8A_KO > 0 & log2FoldChange_PSG9_KD < 0))
+q_np <- nrow(subset(cmp, log2FoldChange_LTR8A_KO < 0 & log2FoldChange_PSG9_KD > 0))
+message("Quadrants: ++=", q_pp, " --=", q_nn, " +-= ", q_pn, " -+= ", q_np)
+
+write.table(cmp, "LTR8A_KO_vs_PSG9_KD_log2FC_compare.tsv",
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# --------------------------- 5) Save session ---------------------------------
+save.image("LTR8A_KO_PSG9_KD_DEGs.RData")
+savehistory("LTR8A_KO_PSG9_KD_DEGs.Rhistory")
