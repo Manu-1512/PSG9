@@ -1,0 +1,217 @@
+#!/usr/bin/env Rscript
+
+# ============================================================
+# SCENIC downstream: regulon AUC heatmaps + tSNE overlays
+# + lineage-specific marker intersections (ICM/EPI/PE/TE)
+#
+# Assumes you already ran SCENIC and have:
+# - AUC matrix (cells x regulons) or (regulons x cells)
+# - tSNE/UMAP coordinates with lineage labels
+# - differential tables per lineage (e.g., FindMarkers outputs)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(gplots)     # heatmap.2
+  library(readr)
+})
+
+set.seed(1)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+ensure_dir <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  invisible(path)
+}
+
+save_png <- function(path, width_cm, height_cm, res = 600, pointsize = 12) {
+  ensure_dir(dirname(path))
+  png(path, width = width_cm, height = height_cm, units = "cm", res = res, pointsize = pointsize)
+}
+
+# Make a “gold->purple” palette like your original
+scenic_palette <- function(n = 199) {
+  colorRampPalette(c("gold", "goldenrod", "purple", "purple4"))(n = n)
+}
+
+# Nice heatmap breaks for p-values or AUC-like scaled quantities
+make_breaks <- function(break_points = c(0, 0.001, 0.01, 0.05, 0.1), n_each = 50) {
+  b <- c(
+    seq(break_points[1], break_points[2], length.out = n_each),
+    seq(break_points[2] + 1e-8, break_points[3], length.out = n_each),
+    seq(break_points[3] + 1e-8, break_points[4], length.out = n_each),
+    seq(break_points[4] + 1e-8, break_points[5], length.out = n_each)
+  )
+  unique(b)
+}
+
+# Robust binary coloring for a gene/regulon “active” column (0/1 or FALSE/TRUE)
+binary_colour <- function(x, active_col = "darkred", inactive_col = "grey70") {
+  x <- as.character(x)
+  x <- ifelse(x %in% c("1", "TRUE", "True", "true"), "1",
+              ifelse(x %in% c("0", "FALSE", "False", "false", ""), "0", x))
+  ifelse(x == "1", active_col, inactive_col)
+}
+
+# ----------------------------
+# 1) Heatmap plotting
+# ----------------------------
+
+plot_heatmap2 <- function(mat,
+                          out_png,
+                          scale_mode = c("none", "row", "column"),
+                          breaks = NULL,
+                          palette = scenic_palette(199),
+                          margins = c(12, 9),
+                          row_dendrogram = TRUE,
+                          col_cluster = FALSE) {
+  scale_mode <- match.arg(scale_mode)
+
+  save_png(out_png, width_cm = 19, height_cm = 19, res = 300, pointsize = 8)
+
+  heatmap.2(
+    as.matrix(mat),
+    density.info = "none",
+    trace = "none",
+    scale = scale_mode,
+    margins = margins,
+    col = palette,
+    breaks = breaks,
+    dendrogram = if (row_dendrogram) "row" else "none",
+    Colv = if (col_cluster) TRUE else "NA"
+  )
+
+  dev.off()
+}
+
+# ----------------------------
+# 2) tSNE/UMAP overlay plotting (base)
+# ----------------------------
+
+plot_embedding_base <- function(df,
+                                xcol,
+                                ycol,
+                                group_col,
+                                out_png,
+                                palette_named = NULL,
+                                pt_cex = 1.8,
+                                legend_pos = "topright",
+                                title = NULL) {
+
+  stopifnot(all(c(xcol, ycol, group_col) %in% colnames(df)))
+
+  grp <- factor(df[[group_col]])
+  if (is.null(palette_named)) {
+    cols <- setNames(rainbow(length(levels(grp))), levels(grp))
+  } else {
+    cols <- palette_named
+  }
+
+  save_png(out_png, width_cm = 14.7, height_cm = 12.8, res = 600, pointsize = 12)
+  plot(
+    x = df[[xcol]], y = df[[ycol]],
+    xlab = xcol, ylab = ycol,
+    pch = 20, cex = pt_cex,
+    col = cols[as.character(grp)],
+    main = title
+  )
+  legend(legend_pos, legend = levels(grp), col = cols[levels(grp)], pch = 20, cex = 1.1)
+  dev.off()
+}
+
+plot_embedding_binary_feature <- function(df,
+                                         xcol,
+                                         ycol,
+                                         feature_col,
+                                         out_png,
+                                         active_label = "Active",
+                                         inactive_label = "Inactive",
+                                         active_col = "darkred",
+                                         inactive_col = "grey70",
+                                         pt_cex = 1.8,
+                                         legend_pos = "bottomleft",
+                                         title = NULL) {
+
+  stopifnot(all(c(xcol, ycol, feature_col) %in% colnames(df)))
+
+  col_vec <- binary_colour(df[[feature_col]], active_col, inactive_col)
+
+  save_png(out_png, width_cm = 14.7, height_cm = 12.8, res = 600, pointsize = 12)
+  plot(
+    x = df[[xcol]], y = df[[ycol]],
+    xlab = xcol, ylab = ycol,
+    pch = 20, cex = pt_cex,
+    col = col_vec,
+    main = title
+  )
+  legend(
+    legend_pos,
+    legend = c(paste0("Cells_", active_label), paste0("Cells_", inactive_label)),
+    col = c(active_col, inactive_col),
+    pch = 20,
+    cex = 1.1
+  )
+  dev.off()
+}
+
+# ----------------------------
+# 3) Marker intersections (EPI/PE/ICM/TE)
+# ----------------------------
+
+# Filter “high-confidence markers” like you did with pct.1/pct.2 thresholds
+filter_markers <- function(df, pct1_min = 0.90, pct2_max = 0.10) {
+  stopifnot(all(c("pct.1", "pct.2") %in% colnames(df)))
+  df %>% filter(pct.1 > pct1_min, pct.2 < pct2_max)
+}
+
+# Inner-join two marker tables by gene name (rowname or "gene" column)
+join_by_gene <- function(a, b, suffixes = c(".A", ".B")) {
+  a <- a %>% tibble::rownames_to_column("gene")
+  b <- b %>% tibble::rownames_to_column("gene")
+  inner_join(a, b, by = "gene", suffix = suffixes)
+}
+
+# Convenience: keep only genes where lineage A has higher avg_logFC than lineage B
+prefer_lineage <- function(joined, fc_col_a, fc_col_b, direction = c("A_gt_B", "A_lt_B")) {
+  direction <- match.arg(direction)
+  stopifnot(all(c(fc_col_a, fc_col_b) %in% colnames(joined)))
+  if (direction == "A_gt_B") joined %>% filter(.data[[fc_col_a]] > .data[[fc_col_b]])
+  else joined %>% filter(.data[[fc_col_a]] < .data[[fc_col_b]])
+}
+
+# ============================================================
+# MAIN (plug in your objects/paths)
+# ============================================================
+
+main <- function() {
+  out_dir <- "results/SCENIC_blastocyst"
+  ensure_dir(out_dir)
+
+  # ----------------------------
+  # A) Heatmaps
+  # ----------------------------
+  # EXPECTED: you provide matrices like:
+  # - man    : e.g., regulon enrichments / -log10 p or similar
+  # - candis : selected regulon AUC matrix (regulons x groups) or similar
+  #
+  # Replace these reads with your real inputs.
+  # Example:
+  # man <- readRDS("inputs/scenic_regulon_enrichment_matrix.rds")
+  # candis <- readRDS("inputs/scenic_auc_candidates.rds")
+
+  # If you already have objects in-memory when sourcing, you can skip these.
+  if (exists("man")) {
+    plot_heatmap2(
+      mat = man,
+      out_png = file.path(out_dir, "heatmap_regulon_enrichment.png"),
+      scale_mode = "none",
+      breaks = make_breaks(c(0, 0.001, 0.01, 0.05, 0.1), n_each = 50),
+      palette = scenic_palette(199),
+      margins = c(12, 9),
+      row_dendrogram = TRUE,
+      col_cluster = FALSE
