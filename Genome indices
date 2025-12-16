@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG="${1:-config/star_genomes.tsv}"
+OUTDIR="${2:-star_build_scripts}"
+mkdir -p "$OUTDIR"
+
+# Usage:
+#   bash scripts/build_star_genome.sh config/star_genomes.tsv star_build_scripts
+# Then submit/run the generated scripts.
+
+while IFS=$'\t' read -r name star_bin threads ram_bytes genome_dir fasta gtf overhang sa_sparseD sa_indexNbases; do
+  [[ -z "${name}" || "${name:0:1}" == "#" ]] && continue
+
+  script="${OUTDIR}/${name}_genome_star_build.sh"
+
+  cat > "$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+STAR_BIN="${star_bin}"
+THREADS="${threads}"
+RAM_BYTES="${ram_bytes}"
+
+GENOME_DIR="${genome_dir}"
+FASTA="${fasta}"
+GTF="${gtf}"
+OVERHANG="${overhang}"
+
+mkdir -p "\${GENOME_DIR}"
+
+"\${STAR_BIN}" \\
+  --runMode genomeGenerate \\
+  --runThreadN "\${THREADS}" \\
+  --limitGenomeGenerateRAM "\${RAM_BYTES}" \\
+  --genomeDir "\${GENOME_DIR}" \\
+  --genomeFastaFiles "\${FASTA}" \\
+  --sjdbGTFfile "\${GTF}" \\
+  --sjdbOverhang "\${OVERHANG}" \\
+  --genomeSAsparseD "${sa_sparseD}" \\
+  --genomeSAindexNbases "${sa_indexNbases}"
+EOF
+
+  chmod +x "$script"
+  echo "Wrote: $script"
+done < "$CONFIG"
