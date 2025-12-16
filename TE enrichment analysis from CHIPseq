@@ -1,0 +1,194 @@
+#!/usr/bin/env Rscript
+
+# ============================================================
+# Build TE-family enrichment matrix from many TSV files
+# + optional merge with H3K4Me1 (or any single-column reference TSV)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tibble)
+})
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+ensure_dir <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  invisible(path)
+}
+
+clean_sample_names <- function(x) {
+  x <- gsub("^Total_TEs_family_enrichment_", "", x)
+  x <- gsub("^Tropho_TEs_family_enrichment_", "", x)
+  x <- gsub("\\.tsv$", "", x)
+  x <- gsub("_V2$", "", x)
+  x <- gsub("__", "_", x)
+  x
+}
+
+# Reads ONE enrichment TSV and returns a named numeric vector:
+# names = TE family, values = chosen numeric column.
+read_enrichment_file <- function(path,
+                                 te_col = 2,
+                                 value_col = 4,
+                                 header = TRUE,
+                                 sep = "\t") {
+  df <- read.delim(path, header = header, stringsAsFactors = FALSE, sep = sep, check.names = FALSE)
+
+  if (ncol(df) < max(te_col, value_col)) {
+    stop("File has fewer columns than expected: ", path)
+  }
+
+  te <- df[[te_col]]
+  val <- suppressWarnings(as.numeric(df[[value_col]]))
+
+  # Keep only non-missing TE names
+  ok <- !is.na(te) & te != ""
+  te <- te[ok]
+  val <- val[ok]
+
+  # If duplicates exist, keep the first (or change to min/mean as desired)
+  dedup <- !duplicated(te)
+  te <- te[dedup]
+  val <- val[dedup]
+
+  stats::setNames(val, te)
+}
+
+# Build matrix from all TSV files in a directory
+build_enrichment_matrix <- function(input_dir,
+                                    pattern = "\\.tsv$",
+                                    te_col = 2,
+                                    value_col = 4,
+                                    header = TRUE) {
+  files <- list.files(input_dir, pattern = pattern, full.names = TRUE)
+  if (length(files) == 0) stop("No files matched in: ", input_dir)
+
+  vecs <- lapply(files, read_enrichment_file, te_col = te_col, value_col = value_col, header = header)
+
+  # Union of all TE families across files
+  all_te <- sort(unique(unlist(lapply(vecs, names))))
+
+  mat <- sapply(vecs, function(v) v[all_te])
+  rownames(mat) <- all_te
+
+  colnames(mat) <- clean_sample_names(basename(files))
+  mat
+}
+
+# Filter rows where any value is below a threshold (your "any(row < 0.01)" logic)
+filter_rows_any_lt <- function(mat, threshold = 0.01) {
+  mat[apply(mat, 1, function(row) any(row < threshold, na.rm = TRUE)), , drop = FALSE]
+}
+
+# Subset by regex on rownames (e.g. LTR8)
+subset_rows_regex <- function(mat, regex) {
+  mat[grepl(regex, rownames(mat)), , drop = FALSE]
+}
+
+# Merge with a reference TSV (e.g. H3K4Me1), returning a data.frame
+# Expects reference file has TE families as rownames OR in a specified column.
+read_reference_vector <- function(path,
+                                  te_col = 1,
+                                  value_col = 4,
+                                  header = TRUE,
+                                  sep = "\t") {
+  ref <- read.delim(path, header = header, stringsAsFactors = FALSE, sep = sep, check.names = FALSE)
+
+  if (ncol(ref) < max(te_col, value_col)) {
+    stop("Reference file has fewer columns than expected: ", path)
+  }
+
+  te <- ref[[te_col]]
+  val <- suppressWarnings(as.numeric(ref[[value_col]]))
+
+  ok <- !is.na(te) & te != ""
+  te <- te[ok]
+  val <- val[ok]
+
+  dedup <- !duplicated(te)
+  stats::setNames(val[dedup], te[dedup])
+}
+
+merge_matrix_with_reference <- function(mat, ref_vec, ref_name = "H3K4Me1") {
+  common <- intersect(rownames(mat), names(ref_vec))
+  if (length(common) == 0) stop("No overlap between matrix rownames and reference TE names.")
+
+  out <- as.data.frame(mat[common, , drop = FALSE])
+  out[[ref_name]] <- ref_vec[common]
+  out
+}
+
+# ============================================================
+# MAIN (edit these paths/params)
+# ============================================================
+main <- function() {
+  input_dir <- "."  # directory containing your enrichment TSV files
+  out_dir <- "results/enrichment_matrix"
+  ensure_dir(out_dir)
+
+  # These match your original intention: rownames from column 2; values from "the 4th column"
+  te_col <- 2
+  value_col <- 4
+
+  mat <- build_enrichment_matrix(
+    input_dir = input_dir,
+    pattern = "\\.tsv$",
+    te_col = te_col,
+    value_col = value_col,
+    header = TRUE
+  )
+
+  write.table(
+    mat,
+    file = file.path(out_dir, "TE_family_enrichment_matrix.tsv"),
+    sep = "\t",
+    quote = FALSE,
+    col.names = NA
+  )
+
+  # Example: inspect LTR8-related families
+  ltr8 <- subset_rows_regex(mat, "LTR8$|LTR8A|LTR8B|LTR8")
+  write.table(
+    ltr8,
+    file = file.path(out_dir, "TE_family_enrichment_LTR8_subset.tsv"),
+    sep = "\t",
+    quote = FALSE,
+    col.names = NA
+  )
+
+  # Example: filter rows where any sample is < 0.01
+  sig01 <- filter_rows_any_lt(mat, threshold = 0.01)
+  write.table(
+    sig01,
+    file = file.path(out_dir, "TE_family_enrichment_any_lt_0.01.tsv"),
+    sep = "\t",
+    quote = FALSE,
+    col.names = NA
+  )
+
+  # Optional: merge with H3K4Me1 reference
+  # (Adjust value_col if your H3K4Me1 TSV stores the key number in a different column.)
+  h3k4me1_path <- "../Tropho_TEs_family_enrichment_H3K4Me1.tsv"
+  if (file.exists(h3k4me1_path)) {
+    h3k4me1 <- read_reference_vector(h3k4me1_path, te_col = 1, value_col = 4, header = TRUE)
+    merged <- merge_matrix_with_reference(mat, h3k4me1, ref_name = "H3K4Me1")
+
+    write.table(
+      merged,
+      file = file.path(out_dir, "TE_family_enrichment_matrix_plus_H3K4Me1.tsv"),
+      sep = "\t",
+      quote = FALSE,
+      col.names = NA
+    )
+  }
+
+  message("Done. Output written to: ", out_dir)
+}
+
+if (sys.nframe() == 0) {
+  main()
+}
