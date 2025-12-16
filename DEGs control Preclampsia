@@ -1,0 +1,234 @@
+#!/usr/bin/env Rscript
+
+# ============================================================
+# PE / Control scRNA-seq dataset (matrix + metadata in first rows)
+#
+# Input file format expected:
+# - tab-delimited
+# - column 1 = row label (metadata field name for first N rows, then gene names)
+# - columns 2..end = cell barcodes
+# - first N rows = metadata fields (e.g., celltype, sample, disease, IUGR, etc.)
+# - remaining rows = gene expression values
+#
+# References (dataset context):
+# - https://www.pnas.org/doi/10.1073/pnas.1822164116
+# - https://www.science.org/doi/10.1126/science.abn7930
+# - https://doi.org/10.1038/s41586-023-06824-9
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(dplyr)
+  library(readr)
+  library(ggplot2)
+})
+
+set.seed(1)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+ensure_dir <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  invisible(path)
+}
+
+save_plot <- function(p, out_png, width_cm = 18, height_cm = 14, dpi = 600) {
+  ensure_dir(dirname(out_png))
+  ggsave(out_png, plot = p, width = width_cm, height = height_cm, units = "cm", dpi = dpi)
+}
+
+# Convert a data.frame (characters) to numeric matrix safely
+df_to_numeric_matrix <- function(df) {
+  m <- as.matrix(df)
+  storage.mode(m) <- "numeric"
+  m
+}
+
+# Read matrix where first N rows are metadata, rest genes
+read_counts_and_metadata <- function(path, n_meta_rows = 22, sep = "\t") {
+  df <- read.delim(path, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE, sep = sep)
+
+  if (nrow(df) <= n_meta_rows) stop("n_meta_rows is >= number of rows in file.")
+  if (ncol(df) < 3) stop("Expected at least 3 columns (label + >=2 cells).")
+
+  # First column is the label column (metadata field names / gene names)
+  label_col <- colnames(df)[1]
+
+  meta_raw <- df[seq_len(n_meta_rows), , drop = FALSE]
+  expr_raw <- df[-seq_len(n_meta_rows), , drop = FALSE]
+
+  # ---- metadata: rows=fields, cols=cells -> transpose -> cells x fields
+  rownames(meta_raw) <- meta_raw[[label_col]]
+  meta_raw[[label_col]] <- NULL
+
+  meta_df <- as.data.frame(t(as.matrix(meta_raw)), stringsAsFactors = FALSE)
+  meta_df <- meta_df %>%
+    tibble::rownames_to_column("cell") %>%
+    tibble::column_to_rownames("cell")
+
+  # ---- expression: rows=genes, cols=cells
+  rownames(expr_raw) <- expr_raw[[label_col]]
+  expr_raw[[label_col]] <- NULL
+
+  # de-duplicate gene names
+  expr_raw <- expr_raw[!duplicated(rownames(expr_raw)), , drop = FALSE]
+
+  counts <- df_to_numeric_matrix(expr_raw)
+  counts_sparse <- Matrix(counts, sparse = TRUE)
+
+  list(counts = counts_sparse, meta = meta_df)
+}
+
+# Normalize IUGR to 0/1/NA and then make label
+make_iugr_label <- function(x) {
+  # accepts 0/1, "0"/"1", TRUE/FALSE, "Yes"/"No"
+  if (is.null(x)) return(rep(NA_character_, 0))
+  if (is.logical(x)) return(ifelse(is.na(x), NA_character_, ifelse(x, "IUGR", "")))
+  x2 <- as.character(x)
+  x2 <- trimws(x2)
+  x2 <- ifelse(x2 %in% c("1", "TRUE", "True", "true", "Yes", "YES", "yes"), "IUGR",
+               ifelse(x2 %in% c("0", "FALSE", "False", "false", "No", "NO", "no", ""), "", NA_character_))
+  x2
+}
+
+# Optional: safe cluster renaming (requires full map)
+rename_clusters_safe <- function(obj, cluster_map_named) {
+  stopifnot(is.character(cluster_map_named), !is.null(names(cluster_map_named)))
+  missing <- setdiff(levels(obj), names(cluster_map_named))
+  if (length(missing) > 0) {
+    stop("Cluster map missing these cluster IDs: ", paste(missing, collapse = ", "))
+  }
+  RenameIdents(obj, cluster_map_named)
+}
+
+# ----------------------------
+# Main analysis
+# ----------------------------
+
+main <- function() {
+  input_path <- "sc_PE_allcells_with_metadata_29-May-2023.txt"
+  out_dir <- "results/PE_scRNAseq"
+  n_meta_rows <- 22
+
+  ensure_dir(out_dir)
+
+  x <- read_counts_and_metadata(input_path, n_meta_rows = n_meta_rows, sep = "\t")
+  counts <- x$counts
+  meta <- x$meta
+
+  obj <- CreateSeuratObject(counts = counts, project = "PE_scRNAseq")
+
+  # Attach metadata (only columns that match cells)
+  common_cells <- intersect(colnames(obj), rownames(meta))
+  if (length(common_cells) == 0) stop("No overlap between expression cell names and metadata cell names.")
+
+  obj <- subset(obj, cells = common_cells)
+  meta <- meta[common_cells, , drop = FALSE]
+  obj <- AddMetaData(obj, metadata = meta)
+
+  # QC metric
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+
+  save_plot(
+    VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3),
+    file.path(out_dir, "QC_violin_prefilter.png"),
+    width_cm = 22, height_cm = 10
+  )
+
+  # Optional filtering (edit thresholds as needed)
+  obj <- subset(obj, subset = nFeature_RNA > 200 & percent.mt < 20)
+
+  # Standard Seurat pipeline
+  obj <- NormalizeData(obj, normalization.method = "LogNormalize", scale.factor = 10000)
+  obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000)
+  obj <- ScaleData(obj, features = rownames(obj))
+  obj <- RunPCA(obj, features = VariableFeatures(obj))
+
+  save_plot(ElbowPlot(obj), file.path(out_dir, "PCA_elbow.png"), width_cm = 14, height_cm = 12)
+
+  obj <- FindNeighbors(obj, dims = 1:10)
+  obj <- FindClusters(obj, resolution = 0.5)
+  obj <- RunUMAP(obj, dims = 1:10)
+
+  save_plot(
+    DimPlot(obj, reduction = "umap", label = TRUE) + NoLegend(),
+    file.path(out_dir, "UMAP_clusters.png"),
+    width_cm = 16, height_cm = 14
+  )
+
+  # Markers
+  markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  write_tsv(markers, file.path(out_dir, "markers_all_clusters.tsv"))
+
+  # Quick “interest” subsets (EGFR / TOP2A / PSG / HLA-G etc.)
+  interest <- markers %>%
+    filter(grepl("^(EGFR|TOP2A|CD14|LTB|PSG|HLA-G)$", gene))
+  write_tsv(interest, file.path(out_dir, "markers_interest.tsv"))
+
+  # ----------------------------------------------------------
+  # OPTIONAL: manual cluster annotation (edit mapping!)
+  # Your original vector was unlabeled; make it explicit and safe.
+  # Example assumes cluster levels are "0","1","2",... etc.
+  # ----------------------------------------------------------
+  # cluster_map <- c(
+  #   "0"  = "Decidua",
+  #   "1"  = "CTB",
+  #   "2"  = "Decidua",
+  #   "3"  = "HofBauer_Macrophage",
+  #   "4"  = "Macrophages",
+  #   "5"  = "Myeloid",
+  #   "6"  = "Pericytes",
+  #   "7"  = "Myeloid",
+  #   "8"  = "CTB",
+  #   "9"  = "STB",
+  #   "10" = "Endothelial",
+  #   "11" = "T_cells",
+  #   "12" = "T_cells",
+  #   "13" = "CTB",
+  #   "14" = "EVTB",
+  #   "15" = "B_cells",
+  #   "16" = "Myeloid"
+  # )
+  #
+  # obj <- rename_clusters_safe(obj, cluster_map)
+  # save_plot(
+  #   DimPlot(obj, reduction = "umap", label = TRUE) + NoLegend(),
+  #   file.path(out_dir, "UMAP_celltypes.png"),
+  #   width_cm = 16, height_cm = 14
+  # )
+
+  # Store identities as celltype label (if you annotated; otherwise clusters)
+  obj$celltype <- as.character(Idents(obj))
+
+  # If you have a disease column in metadata, build condition labels
+  if ("disease" %in% colnames(obj@meta.data)) {
+    obj$celltypeCondition <- paste(obj$celltype, obj@meta.data$disease, sep = "_")
+  } else {
+    obj$celltypeCondition <- obj$celltype
+  }
+
+  # IUGR label (your original logic: drop _0, convert _1 to _IUGR)
+  if ("IUGR" %in% colnames(obj@meta.data)) {
+    iugr_tag <- make_iugr_label(obj@meta.data$IUGR)
+    # celltypeCondition_IUGR: if not IUGR => no suffix; if IUGR => _IUGR
+    obj$celltypeCondition_IUGR <- ifelse(is.na(iugr_tag) | iugr_tag == "",
+                                         obj$celltypeCondition,
+                                         paste0(obj$celltypeCondition, "_", iugr_tag))
+    Idents(obj) <- obj$celltypeCondition_IUGR
+  }
+
+  # Save outputs
+  saveRDS(obj, file = file.path(out_dir, "Preeclampsia_scRNA_seq.rds"))
+
+  # savehistory() takes ONLY a filename (your original call would fail)
+  savehistory(file = file.path(out_dir, "Preeclampsia_scRNA_seq.Rhistory"))
+
+  message("Done. Outputs in: ", out_dir)
+}
+
+if (sys.nframe() == 0) {
+  main()
+}
