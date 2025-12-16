@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STAR_BIN="/programs/STAR/STAR"
+GENOME_DIR="/workdir/Manu/Homo_Genome/STAR_Genome_dir"
+THREADS=4
+
+# Inputs: single-end fastq.gz named like ERRxxxx.fastq.gz in current dir
+# Outputs: <sample>_Aligned.sortedByCoord.out.bam etc.
+
+# Optional: pre-load genome into shared memory (works only if STAR built with genomeLoad support)
+"$STAR_BIN" --genomeLoad LoadAndExit --genomeDir "$GENOME_DIR" || true
+
+for fq in ./*.fastq.gz; do
+  [[ -e "$fq" ]] || { echo "No *.fastq.gz found."; exit 1; }
+
+  sample="$(basename "$fq" .fastq.gz)"
+  echo "==> STAR: $sample"
+
+  "$STAR_BIN" \
+    --genomeDir "$GENOME_DIR" \
+    --readFilesIn "$fq" \
+    --readFilesCommand zcat \
+    --runThreadN "$THREADS" \
+    --alignIntronMin 20 \
+    --alignIntronMax 1000000 \
+    --outFilterMultimapNmax 20 \
+    --chimSegmentMin 15 \
+    --chimJunctionOverhangMin 15 \
+    --outSAMtype BAM SortedByCoordinate \
+    --outReadsUnmapped Fastx \
+    --outFileNamePrefix "${sample}_"
+done
