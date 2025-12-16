@@ -1,0 +1,337 @@
+#!/usr/bin/env Rscript
+
+# ============================================================
+# PSG paper — plotting utilities
+# - PSG expression (Control vs PE) violin/box plots
+# - TE-family enrichment heatmaps (ComplexHeatmap)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+
+  # For base-style violin plots (your original vioplot)
+  # install.packages("vioplot") if needed
+  library(vioplot)
+
+  # For heatmaps
+  # install.packages("ComplexHeatmap") if needed
+  library(ComplexHeatmap)
+  library(circlize)
+})
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+`%||%` <- function(x, y) if (!is.null(x)) x else y
+
+ensure_dir <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  invisible(path)
+}
+
+save_png_base <- function(filename, width_cm, height_cm, res = 600, pointsize = 12) {
+  png(filename, width = width_cm, height = height_cm, units = "cm", res = res, pointsize = pointsize)
+}
+
+assert_psg <- function(psg, group) {
+  stopifnot(is.matrix(psg) || is.data.frame(psg))
+  psg <- as.matrix(psg)
+  stopifnot(length(group) == ncol(psg))
+  stopifnot(all(!is.na(group)))
+  psg
+}
+
+# ============================================================
+# 1) PSG expression plots (Control vs PE)
+# ============================================================
+
+plot_psg_vioplot <- function(values,
+                            group,
+                            out_png,
+                            title,
+                            ylab = "Log2(TPM+1)",
+                            ylim = c(0, 9),
+                            group_levels = c("Control", "PE"),
+                            width_cm = 10.7,
+                            height_cm = 12.8,
+                            res = 600) {
+
+  group <- factor(group, levels = group_levels)
+  stopifnot(all(levels(group) %in% group_levels))
+
+  x1 <- values[group == group_levels[1]]
+  x2 <- values[group == group_levels[2]]
+
+  save_png_base(out_png, width_cm, height_cm, res = res, pointsize = 12)
+  vioplot(
+    x1, x2,
+    ylim = ylim,
+    col = c("grey80", "pink3"),
+    border = "black",
+    lwd = 2,
+    cex = 1,
+    ylab = ylab,
+    pchMed = 21,
+    rectCol = "black",
+    colMed = "black",
+    wex = 1,
+    lty = 7,
+    las = 2,
+    names = group_levels
+  )
+  title(main = title)
+  dev.off()
+}
+
+plot_psg_violin_ggplot <- function(values,
+                                  group,
+                                  out_png,
+                                  title,
+                                  ylab = "Log2(TPM+1)",
+                                  group_levels = c("Control", "PE"),
+                                  width_cm = 10.7,
+                                  height_cm = 12.8,
+                                  dpi = 600) {
+
+  df <- tibble(value = values, group = factor(group, levels = group_levels))
+
+  p <- ggplot(df, aes(x = group, y = value, fill = group)) +
+    geom_violin(trim = FALSE) +
+    geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white") +
+    labs(title = title, y = ylab, x = NULL) +
+    theme_classic() +
+    scale_fill_manual(values = c("grey80", "orangered"))
+
+  ggsave(out_png, plot = p, width = width_cm, height = height_cm, units = "cm", dpi = dpi)
+}
+
+plot_psg_gene <- function(psg,
+                          gene,
+                          group,
+                          out_dir,
+                          make_vioplot = TRUE,
+                          make_ggplot = TRUE,
+                          prefix = NULL) {
+
+  psg <- assert_psg(psg, group)
+  stopifnot(gene %in% rownames(psg))
+
+  ensure_dir(out_dir)
+
+  values <- as.numeric(psg[gene, ])
+  prefix <- prefix %||% gene
+
+  if (make_vioplot) {
+    plot_psg_vioplot(
+      values = values,
+      group = group,
+      out_png = file.path(out_dir, paste0(prefix, "_Expression_Control_PE.png")),
+      title = paste0(gene, " expression")
+    )
+  }
+
+  if (make_ggplot) {
+    plot_psg_violin_ggplot(
+      values = values,
+      group = group,
+      out_png = file.path(out_dir, paste0(prefix, "_Expression_Control_PE_ViolinPlot.png")),
+      title = paste0(gene, " expression")
+    )
+  }
+}
+
+wilcox_by_gene <- function(psg, genes, group, group_levels = c("Control", "PE")) {
+  psg <- assert_psg(psg, group)
+  group <- factor(group, levels = group_levels)
+
+  res <- lapply(genes, function(g) {
+    stopifnot(g %in% rownames(psg))
+    v <- as.numeric(psg[g, ])
+    p <- wilcox.test(v[group == group_levels[1]], v[group == group_levels[2]])$p.value
+    tibble(gene = g, p_value = p)
+  }) |> bind_rows() |>
+    mutate(p_adj_bh = p.adjust(p_value, method = "BH"))
+
+  res
+}
+
+# ============================================================
+# 2) TE-family enrichment heatmaps (ComplexHeatmap)
+# ============================================================
+
+# Reads a directory of TSVs and builds a numeric matrix.
+# Assumes each TSV has TE families as rows and at least one numeric column of interest.
+read_enrichment_dir <- function(input_dir,
+                                pattern = "\\.tsv$",
+                                value_col = 4,
+                                sample_name_clean = TRUE) {
+
+  files <- list.files(input_dir, pattern = pattern, full.names = TRUE)
+  stopifnot(length(files) > 0)
+
+  read_one <- function(fp) {
+    x <- read.delim(fp, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+    # Your original code used row.names from column 2 and took column 4 as value:
+    # row.names(data_frame) <- data_frame[,2]; dat <- data_frame[,4]
+    stopifnot(ncol(x) >= max(2, value_col))
+    rn <- x[[2]]
+    val <- x[[value_col]]
+    out <- tibble(te_family = rn, value = as.numeric(val))
+    out
+  }
+
+  lst <- lapply(files, read_one)
+
+  wide <- Reduce(function(a, b) full_join(a, b, by = "te_family"), lst)
+  mat <- wide |> column_to_rownames("te_family") |> as.matrix()
+
+  colnames(mat) <- basename(files)
+  if (sample_name_clean) {
+    colnames(mat) <- gsub("TEs_family_enrichment", "", colnames(mat))
+    colnames(mat) <- gsub("\\.tsv$", "", colnames(mat))
+    colnames(mat) <- gsub("__", "_", colnames(mat))
+  }
+
+  mat
+}
+
+# Read Branco table (expects TE families in rownames column 1 in your original file)
+read_branco_table <- function(path,
+                              cols_keep = c("H3K4Me3", "GATA3_TSC", "H3K27Ac", "TFAP2C_TSC")) {
+  br <- read.delim(path, row.names = 1, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+
+  # Keep only columns that exist (safer across versions)
+  keep <- intersect(cols_keep, colnames(br))
+  if (length(keep) == 0) stop("None of cols_keep found in Branco table. Available: ", paste(colnames(br), collapse = ", "))
+  br[, keep, drop = FALSE]
+}
+
+merge_by_rownames <- function(a, b) {
+  a <- as.data.frame(a)
+  b <- as.data.frame(b)
+  a$Row.names <- rownames(a)
+  b$Row.names <- rownames(b)
+
+  m <- merge(a, b, by = "Row.names", all = FALSE)
+  rownames(m) <- m$Row.names
+  m$Row.names <- NULL
+  as.matrix(m)
+}
+
+# If your matrix is p-values, convert to -log2(p) for plotting.
+p_to_neglog2 <- function(p_mat, p_floor = 1e-6) {
+  p_mat <- as.matrix(p_mat)
+  -log2(pmax(p_mat, p_floor))
+}
+
+filter_rows_any <- function(mat, fn) {
+  mat[apply(mat, 1, fn), , drop = FALSE]
+}
+
+plot_complex_heatmap <- function(mat,
+                                 out_png,
+                                 name = "-log2(P)",
+                                 breaks = c(0, 2, 4, 5, 6),
+                                 colors = c("white", "yellow", "orange", "orangered", "maroon"),
+                                 km = 4,
+                                 row_font = 6,
+                                 col_font = 10,
+                                 width_cm = 22.7,
+                                 height_cm = 26.8,
+                                 res = 300) {
+
+  ensure_dir(dirname(out_png))
+
+  save_png_base(out_png, width_cm, height_cm, res = res, pointsize = 12)
+  Heatmap(
+    as.matrix(mat),
+    name = name,
+    col = colorRamp2(breaks, colors),
+    row_names_gp = gpar(fontsize = row_font),
+    column_names_gp = gpar(fontsize = col_font),
+    km = km,
+    gap = unit(1, "mm"),
+    rect_gp = gpar(col = "grey20", lwd = 0.6)
+  )
+  dev.off()
+}
+
+subset_rows_by_regex <- function(mat, patterns) {
+  rx <- paste(patterns, collapse = "|")
+  mat[grepl(rx, rownames(mat)), , drop = FALSE]
+}
+
+# ============================================================
+# Example “main” (edit paths + gene list and run)
+# ============================================================
+# NOTE: This block is safe to keep in GitHub; it won’t run unless you call it.
+
+run_all_plots <- function(psg,
+                          out_dir_psg = "results/psg_expression",
+                          genes = c("PSG8", "PSG6", "PSG9", "PSG5", "PSG3", "PSG7", "PSG1", "PSG2", "PSG11", "PSG4"),
+                          n_control = 8,
+                          n_pe = 10,
+                          out_dir_enrich = "results/te_enrichment",
+                          enrichment_dir = NULL,
+                          branco_path = NULL) {
+
+  # ---- PSG expression ----
+  group <- c(rep("Control", n_control), rep("PE", n_pe))
+  stopifnot(ncol(psg) == length(group))
+
+  for (g in genes) {
+    plot_psg_gene(psg, g, group, out_dir = out_dir_psg, make_vioplot = TRUE, make_ggplot = TRUE)
+  }
+
+  stats <- wilcox_by_gene(psg, genes, group)
+  ensure_dir(out_dir_psg)
+  write_tsv(stats, file.path(out_dir_psg, "wilcoxon_Control_vs_PE.tsv"))
+
+  # ---- Enrichment heatmaps (optional; only runs if paths provided) ----
+  if (!is.null(enrichment_dir) && !is.null(branco_path)) {
+    evt_mat <- read_enrichment_dir(enrichment_dir, value_col = 4)
+    br_mat  <- read_branco_table(branco_path)
+
+    merged <- merge_by_rownames(br_mat, evt_mat)
+
+    # Your original filtering was like: any(row < 0.02/0.021/0.05)
+    # Keep that behaviour explicit here:
+    merged_filt <- filter_rows_any(merged, function(row) any(row < 0.021, na.rm = TRUE))
+
+    merged_log <- p_to_neglog2(merged_filt, p_floor = 1e-6)
+
+    plot_complex_heatmap(
+      merged_log,
+      out_png = file.path(out_dir_enrich, "Heatmap_Merged_Enrichment_Branco_EVT_TSC.png"),
+      width_cm = 22.7,
+      height_cm = 26.8,
+      km = 4,
+      row_font = 6
+    )
+
+    # Candidate TE families (cleaned, correct regex selection)
+    candidate_patterns <- c(
+      "MLT1A", "MLT1F2", "LTR3B", "SVA_F", "MER48", "LTR12E", "L1HS", "L1PA2",
+      "^LTR8$", "LTR5_H", "LTR8A", "MIR", "HERVKC4", "LTR10D", "LTR14", "LTR5B",
+      "MER50", "HERVK3", "HERV1_LT"
+    )
+
+    cand <- subset_rows_by_regex(merged_log, candidate_patterns)
+    if (nrow(cand) > 0) {
+      plot_complex_heatmap(
+        cand,
+        out_png = file.path(out_dir_enrich, "Heatmap_Candidates_Enrichment_Branco_EVT_TSC.png"),
+        width_cm = 22.7,
+        height_cm = 18.8,
+        km = 4,
+        row_font = 10
+      )
+    }
+  }
+
+  invisible(TRUE)
+}
