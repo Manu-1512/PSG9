@@ -1,0 +1,60 @@
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+})
+
+# Build a stable locus ID like:
+# chr7:92098021-92106726_HERV17-int(+)
+# Adjust columns to match your TE GTF/featureCounts annotation table.
+
+make_locus_id <- function(df,
+                          chr_col = "chr",
+                          start_col = "start",
+                          end_col = "end",
+                          name_col = "rmsk",
+                          strand_col = "strand",
+                          include_strand = TRUE) {
+  stopifnot(all(c(chr_col, start_col, end_col, name_col) %in% colnames(df)))
+
+  id <- paste0(df[[chr_col]], ":", df[[start_col]], "-", df[[end_col]], "_", df[[name_col]])
+  if (include_strand && strand_col %in% colnames(df)) {
+    id <- paste0(id, "(", df[[strand_col]], ")")
+  }
+  id
+}
+
+# Aggregate numeric columns by a grouping variable (e.g., rmsk family)
+aggregate_by_group <- function(df, group_col = "rmsk", fun = mean, na.rm = TRUE) {
+  stopifnot(group_col %in% colnames(df))
+
+  num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(across(all_of(num_cols), ~ fun(.x, na.rm = na.rm)), .groups = "drop")
+}
+
+# Example usage (adapt to your table):
+# te <- read_tsv("hiPSC1_rmsk.tsv", comment = "#")
+# te$locus_id <- make_locus_id(te, chr_col="Chr", start_col="Start", end_col="End", name_col="Geneid", strand_col="Strand")
+# agg <- aggregate_by_group(te, group_col="Geneid", fun=mean)
+
+ # Put them in a plain text file in the repo, e.g. resources/loci_of_interest.txt, and then read/filter them in R:
+
+loci <- readLines("resources/loci_of_interest.txt")
+te_filt <- te %>% filter(locus_id %in% loci | Geneid %in% loci)
+
+# Fix for your original rowname line
+
+# Your line:
+
+rownames(dat) <- (paste0(dat[,2],":",dat[,3],"-",dat[,4],"_", dat[,1],"_",dat[,5]))
+
+
+# That’s fine, but it’s brittle because it relies on column positions. Replace with named columns (from the helper above), e.g.:
+
+dat$locus_id <- make_locus_id(dat,
+  chr_col="chr", start_col="start", end_col="end",
+  name_col="rmsk", strand_col="strand"
+)
+rownames(dat) <- dat$locus_id
